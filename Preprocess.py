@@ -1,6 +1,4 @@
-import sys
-# sys.path.append('..')
-# from utils.tools import *
+# Full Preprocess.py with Kaggle fixes
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -11,7 +9,9 @@ import numpy as np
 import os
 import random
 import pickle
-from config.hyper_params_config import dataset_root, pretrained_root
+
+# Global vars (from Cell 1)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class IEMOCAPDataset(Dataset):
     def __init__(self, feature_save_path):
@@ -23,31 +23,53 @@ class IEMOCAPDataset(Dataset):
     def __getitem__(self, index):
         return self.data[index]
 
-def process_and_save_dataset(data_list_path, iemocap_aug_datapath, feature_save_path, max_duration=25):
+def process_and_save_dataset(data_list_path, iemocap_aug_datapath, feature_save_path, max_duration=25, raw_data_dir=RAW_DATA_DIR):
     # Check if the saved pkl file already exists
     if os.path.exists(feature_save_path):
         print(f"{feature_save_path} already exists, skipping data processing.")
         return
-    augmented_audio = os.listdir(iemocap_aug_datapath)
-    augmented_audio_dictionary = {}
+    # If no aug dir, skip aug dict (fallback below)
+    if iemocap_aug_datapath and os.path.exists(iemocap_aug_datapath):
+        augmented_audio = os.listdir(iemocap_aug_datapath)
+        augmented_audio_dictionary = {}
+        for item in augmented_audio:
+            gt_audio = "Ses" + item.split("Ses")[-1]
+            if gt_audio in augmented_audio_dictionary:
+                augmented_audio_dictionary[gt_audio].append(os.path.join(iemocap_aug_datapath, item))
+            else:
+                augmented_audio_dictionary[gt_audio] = [os.path.join(iemocap_aug_datapath, item)]
+    else:
+        augmented_audio_dictionary = {}
+        print("No aug dir found; using raw audio as augmented.")
+    
     with open(data_list_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-    for item in augmented_audio:
-        gt_audio = "Ses" + item.split("Ses")[-1]
-        if gt_audio in augmented_audio_dictionary:
-            augmented_audio_dictionary[gt_audio].append(iemocap_aug_datapath + item)
-        else:
-            augmented_audio_dictionary[gt_audio] = [iemocap_aug_datapath + item]
     dataset_features = []
     # Traverse the entire dataset and process features
     for index in range(len(lines)):
-        raw_audio_path, raw_text, label, augmented_text = lines[index].replace('\n', '').split('\t')
-        raw_audio_name = os.path.basename(raw_audio_path)
-        augmented_wav_index = random.randint(0, len(augmented_audio_dictionary[raw_audio_name]) - 1)
-        augmented_wav_path = augmented_audio_dictionary[raw_audio_name][augmented_wav_index]
+        line = lines[index].replace('\n', '')
+        raw_audio_path_rel, raw_text, label, augmented_text = line.split('\t')
+        raw_audio_name = os.path.basename(raw_audio_path_rel)
+        
+        # Full raw path
+        raw_audio_path = str(raw_data_dir / raw_audio_path_rel)
+        
+        # Aug path: Fallback to raw if no dict entry
+        if raw_audio_name in augmented_audio_dictionary and augmented_audio_dictionary[raw_audio_name]:
+            augmented_wav_index = random.randint(0, len(augmented_audio_dictionary[raw_audio_name]) - 1)
+            augmented_wav_path = augmented_audio_dictionary[raw_audio_name][augmented_wav_index]
+        else:
+            augmented_wav_path = raw_audio_path  # Fallback
+            print(f"Using raw as aug for {raw_audio_name}")
+        
         # Load original and augmented audio
-        raw_waveform, raw_sample_rate = torchaudio.load(raw_audio_path)
-        aug_waveform, aug_sample_rate = torchaudio.load(augmented_wav_path)
+        try:
+            raw_waveform, raw_sample_rate = torchaudio.load(raw_audio_path)
+            aug_waveform, aug_sample_rate = torchaudio.load(augmented_wav_path)
+        except Exception as e:
+            print(f"Error loading {raw_audio_name}: {e}")
+            continue
+        
         # Calculate audio duration and filter out audio exceeding 25 seconds
         raw_duration = raw_waveform.shape[1] / raw_sample_rate
         aug_duration = aug_waveform.shape[1] / aug_sample_rate
@@ -55,6 +77,7 @@ def process_and_save_dataset(data_list_path, iemocap_aug_datapath, feature_save_
         if raw_duration > max_duration or aug_duration > max_duration:
             print(f"Skipping sample {raw_audio_name}, because the audio duration exceeded {max_duration} seconds.")
             continue
+        
         # Save audio features
         raw_waveform = raw_waveform.numpy()
         aug_waveform = aug_waveform.numpy()
@@ -74,10 +97,13 @@ def process_and_save_dataset(data_list_path, iemocap_aug_datapath, feature_save_
         }
         # Add to the list
         dataset_features.append(features)
+        if (index + 1) % 10 == 0:
+            print(f"Processed {index + 1}/{len(lines)} samples...")
+    
     # Save all processed features to a pkl file
     with open(feature_save_path, 'wb') as f:
         pickle.dump(dataset_features, f)
-    print(f"Features have been saved to {feature_save_path}")
+    print(f"Features have been saved to {feature_save_path} ({len(dataset_features)} samples)")
 
 def collate_fn(batch):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,16 +168,15 @@ class EmotionModel(Wav2Vec2PreTrainedModel):
         self.wav2vec2 = Wav2Vec2Model(config)
         self.classifier = RegressionHead(config)
         self.init_weights()
-    def forward(
-            self,input_values,attention_mask=None):
-        outputs = self.wav2vec2(input_values,attention_mask=attention_mask)
+    def forward(self, input_values, attention_mask=None):
+        outputs = self.wav2vec2(input_values, attention_mask=attention_mask)
         hidden_states0 = outputs[0]
         hidden_states1 = torch.mean(hidden_states0, dim=1)
         logits = self.classifier(hidden_states1)
         return hidden_states0, hidden_states1, logits
 
 ### Encapsulate the entire wav2vec computation process, where the processor encodes the speech, similar to the tokenizer in BERT.
-def process_func(x: np.ndarray, sampling_rate: int) -> np.ndarray:
+def process_func(x: np.ndarray, sampling_rate: int):
     y = processor(x, sampling_rate=sampling_rate)
     y = y['input_values'][0]
     y = y.reshape(1, -1)
@@ -159,41 +184,26 @@ def process_func(x: np.ndarray, sampling_rate: int) -> np.ndarray:
     ### Here, if embeddings is true, the returned y is actually the pooled hidden_states, otherwise it is logits
     with torch.no_grad():
         y = audio_model(y)
-    return y[0],y[1],y[2]
+    return y[0], y[1], y[2]
 
 ### Use processor to get the speech tokenizer
-def audio_processor(x: np.ndarray, sampling_rate: int) -> np.ndarray:
-    inputs = processor(x, sampling_rate=sampling_rate,return_attention_mask=True, padding=True)
-    input_values = inputs['input_values'][0] # Input audio features (input_ids)
-    attention_mask = inputs['attention_mask'][0] # attention mask
-    return input_values,attention_mask
+def audio_processor(x: np.ndarray, sampling_rate: int):
+    inputs = processor(x, sampling_rate=sampling_rate, return_attention_mask=True, padding=True)
+    input_values = inputs['input_values'][0]  # Input audio features (input_ids)
+    attention_mask = inputs['attention_mask'][0]  # attention mask
+    return input_values, attention_mask
 
-# if __name__ =='__main__':
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_name = pretrained_root/'wav2vec2-large-uncased'
+# Initialize processor and model (global)
 processor = Wav2Vec2Processor.from_pretrained(model_name)
-audio_model = EmotionModel.from_pretrained(model_name).to(device)
+config = Wav2Vec2PreTrainedModel.from_pretrained(model_name).config
+audio_model = EmotionModel(config).to(device)  # Use config for init
+
+print("Models loaded! Starting processing...")
+
 # Process and save training and validation data
-session_id=1
-train_data_list_path = dataset_root/f'dataset_session{session_id}/train_data.txt'
-val_data_list_path = dataset_root/f'dataset_session{session_id}/test_data.txt'
-# iemocap_aug_datapath = dataset_root/'MMER-main/data/iemocap_aug/out/'# it's no use in main experiment
-# uncomment if you want to process audio file
+train_data_list_path = output_dir / 'train_data.txt'
+val_data_list_path = output_dir / 'test_data.txt'
 # Set maximum audio length to 25 seconds
-# process_and_save_dataset(train_data_list_path, iemocap_aug_datapath, f'train_features_session{session_id}.pkl', max_duration=25)
-# process_and_save_dataset(val_data_list_path, iemocap_aug_datapath, f'val_features_session{session_id}.pkl', max_duration=25)
+process_and_save_dataset(train_data_list_path, iemocap_aug_datapath, output_dir / f'train_features_session{session_id}.pkl', max_duration=25, raw_data_dir=RAW_DATA_DIR)
+process_and_save_dataset(val_data_list_path, iemocap_aug_datapath, output_dir / f'val_features_session{session_id}.pkl', max_duration=25, raw_data_dir=RAW_DATA_DIR)
 print("pre_processor finished")
-# # # Load saved features
-# train_dataset = IEMOCAPDataset('train_features_session2.pkl')
-# val_dataset = IEMOCAPDataset('val_features_session2.pkl')
-# # # Create dataloader
-# train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-# val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-#
-# for batch in train_dataloader:
-# raw_audio_input_ids, raw_attention_masks, raw_text, labels = batch['raw_audio_input_ids'], batch['raw_attention_masks'], \
-# batch['raw_text'], batch['label']
-# print("raw_audio_input_ids:",raw_audio_input_ids.shape)
-# print("raw_attention_masks:", raw_attention_masks.shape)
-# print("raw_text:", raw_text)
-# print("labels:", labels)
